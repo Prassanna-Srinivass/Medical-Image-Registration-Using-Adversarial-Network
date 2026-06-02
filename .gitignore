@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.venv.bak/
+
+# Data and datasets
+data/
+dataset/
+
+# Model artifacts
+*.pth
