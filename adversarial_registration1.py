@@ -180,24 +180,35 @@ class RegistrationGenerator(nn.Module):
         return self.flow_conv(d1)
 
 class AlignmentDiscriminator(nn.Module):
+    """ Evaluates registration alignment using Spectral Normalization to prevent overpowering """
     def __init__(self, in_channels=2):
-        super(AlignmentDiscriminator, self).__init__()
+        super().__init__()
+        # Import spectral_norm - The ultimate GAN stabilizer
+        import torch.nn.utils.spectral_norm as spectral_norm
+
         self.model = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=4, stride=2, padding=1),
+            # Layer 1
+            spectral_norm(nn.Conv2d(in_channels, 32, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Dropout2d(0.3), # <-- Blinds the discriminator slightly so it can't cheat
+            
+            # Layer 2 (Removed BatchNorm, it ruins GAN discriminators)
+            spectral_norm(nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Dropout2d(0.3),
+            
+            # Layer 3
+            spectral_norm(nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout2d(0.3),
+            
+            # Final Output Layer
             nn.Conv2d(128, 1, kernel_size=4, stride=1, padding=1)
         )
 
     def forward(self, img1, img2):
         x = torch.cat([img1, img2], dim=1)
         return self.model(x)
-
 # =====================================================================
 # 4. Training & Validation Setup
 # =====================================================================
@@ -237,7 +248,7 @@ def main():
     lambda_smooth = 0.5    # Small penalty to prevent extreme tearing
     lambda_gan = 0.1       # Keep GAN impact low to avoid instability
     
-    epochs = 10
+    epochs = 1
     print(f"\nStarting training loop for {epochs} epochs...")
     
     for epoch in range(epochs):
