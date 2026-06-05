@@ -1,161 +1,201 @@
-import streamlit as st
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import transforms
+"""
+ui.py  —  Chest X-Ray Registration Frontend
+────────────────────────────────────────────────────────────────────
+Gradio browser UI.  Upload a Fixed and Moving X-ray, click Register,
+and instantly see:
+  • Warped (registered) image
+  • |Fixed − Warped| difference heatmap
+  • Side-by-side comparison strip
+  • NCC alignment score
+
+Requirements:
+  pip install gradio requests pillow
+
+Run (make sure inference_server.py is already running):
+  python ui.py
+  # Opens http://localhost:7860 in your browser automatically
+────────────────────────────────────────────────────────────────────
+"""
+
+import base64
+import io
+import requests
 from PIL import Image
-import numpy as np
+import gradio as gr
 
-# ==========================================
-# 1. AI Model Architecture (Copied here so UI is standalone)
-# ==========================================
-class SpatialTransformer(nn.Module):
-    def __init__(self, size):
-        super().__init__()
-        self.size = size
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, size[0]), 
-            torch.linspace(-1, 1, size[1]), 
-            indexing='ij'
-        )
-        grid = torch.stack([grid_x, grid_y], dim=0)
-        self.register_buffer('grid', grid.unsqueeze(0))
+# ── Server config ────────────────────────────────────────────────────
+SERVER_URL = "http://localhost:5000"
 
-    def forward(self, src, flow):
-        H, W = self.size
-        flow_normalized = torch.zeros_like(flow)
-        flow_normalized[:, 0, :, :] = 2.0 * flow[:, 0, :, :] / max(W - 1, 1)
-        flow_normalized[:, 1, :, :] = 2.0 * flow[:, 1, :, :] / max(H - 1, 1)
-        
-        new_grid = self.grid + flow_normalized
-        new_grid = new_grid.permute(0, 2, 3, 1)
-        return F.grid_sample(src, new_grid, mode='bilinear', padding_mode='border', align_corners=True)
+# ─────────────────────────────────────────────────────────────────────
+# Core inference call
+# ─────────────────────────────────────────────────────────────────────
 
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm2d(out_channels),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm2d(out_channels),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-    def forward(self, x):
-        return self.double_conv(x)
+def run_registration(fixed_img: Image.Image, moving_img: Image.Image):
+    """
+    Sends fixed + moving images to the inference server,
+    returns (warped, diff_heatmap, overlay_strip, ncc_label).
+    """
+    if fixed_img is None or moving_img is None:
+        raise gr.Error("Please upload both a Fixed and a Moving image.")
 
-class RegistrationGenerator(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2):
-        super().__init__()
-        self.inc = DoubleConv(in_channels, 32)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(32, 64))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
-        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
-        
-        self.up3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.conv3 = DoubleConv(256, 128)
-        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.conv2 = DoubleConv(128, 64)
-        self.up1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
-        self.conv1 = DoubleConv(64, 32)
-        
-        self.flow_conv = nn.Conv2d(32, out_channels, kernel_size=3, padding=1)
+    # Convert PIL → bytes for multipart upload
+    def pil_to_bytes(img: Image.Image) -> bytes:
+        buf = io.BytesIO()
+        img.convert("L").save(buf, format="PNG")
+        buf.seek(0)
+        return buf.read()
 
-    def forward(self, m, f):
-        x = torch.cat([m, f], dim=1)
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        
-        u3 = self.up3(x4)
-        u3 = torch.cat([u3, x3], dim=1)
-        d3 = self.conv3(u3)
-        
-        u2 = self.up2(d3)
-        u2 = torch.cat([u2, x2], dim=1)
-        d2 = self.conv2(u2)
-        
-        u1 = self.up1(d2)
-        u1 = torch.cat([u1, x1], dim=1)
-        d1 = self.conv1(u1)
-        
-        return self.flow_conv(d1)
-
-# ==========================================
-# 2. AI Inference Setup
-# ==========================================
-@st.cache_resource # Caches the model so it doesn't reload on every click
-def load_ai_model():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    generator = RegistrationGenerator().to(device)
-    
-    # Load your saved weights!
     try:
-        generator.load_state_dict(torch.load("registration_model.pth", map_location=device, weights_only=True))
-        generator.eval()
-    except FileNotFoundError:
-        st.error("Model weights 'registration_model.pth' not found! Make sure you trained the model first.")
-        return None, None, None
-        
-    transformer = SpatialTransformer(size=(128, 128)).to(device)
-    return generator, transformer, device
+        resp = requests.post(
+            f"{SERVER_URL}/register",
+            files={
+                "fixed":  ("fixed.png",  pil_to_bytes(fixed_img),  "image/png"),
+                "moving": ("moving.png", pil_to_bytes(moving_img), "image/png"),
+            },
+            timeout=30,
+        )
+    except requests.exceptions.ConnectionError:
+        raise gr.Error(
+            "Cannot reach the inference server at localhost:5000.\n"
+            "Make sure you have run:  python inference_server.py"
+        )
 
-def process_image(img):
-    """Formats the uploaded image for the AI"""
-    transform = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.ToTensor()
-    ])
-    img = Image.open(img).convert('L')
-    return transform(img).unsqueeze(0) # Add batch dimension
+    if resp.status_code != 200:
+        raise gr.Error(f"Server error {resp.status_code}: {resp.text}")
 
-# ==========================================
-# 3. Streamlit User Interface
-# ==========================================
-st.set_page_config(page_title="Medical Image Registration", layout="wide")
-st.title("🩻 AI Medical Image Registration")
-st.write("Upload a Fixed (Target) image and a Moving (Shifted) image. The AI will align the bones and output the Warped result.")
+    data = resp.json()
 
-# Load AI
-generator, transformer, device = load_ai_model()
+    # Decode base64 images back to PIL
+    def b64_to_pil(b64: str) -> Image.Image:
+        return Image.open(io.BytesIO(base64.b64decode(b64)))
 
-if generator:
-    # Upload widgets side-by-side
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("1. Upload Moving Image")
-        moving_file = st.file_uploader("Choose moving image", type=["png", "jpg", "jpeg"])
-    with col2:
-        st.subheader("2. Upload Fixed (Target) Image")
-        fixed_file = st.file_uploader("Choose fixed image", type=["png", "jpg", "jpeg"])
+    warped_img  = b64_to_pil(data["warped_b64"])
+    diff_img    = b64_to_pil(data["diff_b64"])
+    overlay_img = b64_to_pil(data["overlay_b64"])
+    score       = data["ncc_score"]
 
-    if moving_file and fixed_file:
-        if st.button("🚀 Align Images", use_container_width=True):
-            with st.spinner('AI is generating the deformation field...'):
-                
-                # Format images
-                m_tensor = process_image(moving_file).to(device)
-                f_tensor = process_image(fixed_file).to(device)
+    # NCC is in [−1, 1]; express as a readable label
+    quality = "Excellent" if score > 0.85 else \
+              "Good"      if score > 0.65 else \
+              "Fair"      if score > 0.40 else "Poor"
 
-                # Run AI Prediction
-                with torch.no_grad():
-                    flow = generator(m_tensor, f_tensor)
-                    warped_tensor = transformer(m_tensor, flow)
+    ncc_label = f"NCC Score: {score:.4f}  ({quality} alignment)"
 
-                # Convert tensors back to viewable images
-                m_img_show = m_tensor[0, 0].cpu().numpy()
-                f_img_show = f_tensor[0, 0].cpu().numpy()
-                w_img_show = warped_tensor[0, 0].cpu().numpy()
+    return warped_img, diff_img, overlay_img, ncc_label
 
-                st.success("Registration Complete!")
 
-                # Display Results
-                res_col1, res_col2, res_col3 = st.columns(3)
-                with res_col1:
-                    st.image(m_img_show, caption="Moving Image", use_container_width=True, clamp=True)
-                with res_col2:
-                    st.image(f_img_show, caption="Fixed (Target) Image", use_container_width=True, clamp=True)
-                with res_col3:
-                    st.image(w_img_show, caption="AI Warped Result", use_container_width=True, clamp=True)
+def check_server():
+    """Ping /health and return a status string for the UI banner."""
+    try:
+        r = requests.get(f"{SERVER_URL}/health", timeout=3)
+        d = r.json()
+        return f"✅  Server online — running on **{d['device'].upper()}**"
+    except Exception:
+        return "❌  Server offline — run `python inference_server.py` first"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Gradio UI
+# ─────────────────────────────────────────────────────────────────────
+
+with gr.Blocks(
+    title="Chest X-Ray GAN Registration",
+    theme=gr.themes.Soft(),
+    css="""
+        #title  { text-align: center; }
+        #status { text-align: center; font-size: 0.95em; padding: 6px 0; }
+        .score-box textarea { font-size: 1.2em !important; font-weight: bold; text-align: center; }
+    """,
+) as demo:
+
+    # ── Header ───────────────────────────────────────────────────────
+    gr.Markdown("# 🫁 Chest X-Ray Image Registration", elem_id="title")
+    gr.Markdown(
+        "Upload a **Fixed** (target) and **Moving** (source) X-ray. "
+        "The GAN generator will warp the Moving image to align with the Fixed image.",
+        elem_id="title",
+    )
+
+    server_status = gr.Markdown(check_server(), elem_id="status")
+    refresh_btn   = gr.Button("↻ Refresh server status", size="sm", variant="secondary")
+    refresh_btn.click(fn=check_server, outputs=server_status)
+
+    gr.Markdown("---")
+
+    # ── Input row ────────────────────────────────────────────────────
+    with gr.Row():
+        fixed_input  = gr.Image(
+            label="Fixed Image (Target)",
+            type="pil",
+            image_mode="L",
+            height=300,
+        )
+        moving_input = gr.Image(
+            label="Moving Image (To be registered)",
+            type="pil",
+            image_mode="L",
+            height=300,
+        )
+
+    register_btn = gr.Button("🔬 Register Images", variant="primary", size="lg")
+
+    gr.Markdown("---")
+
+    # ── Output row ───────────────────────────────────────────────────
+    with gr.Row():
+        warped_out  = gr.Image(label="Warped Result",              height=300)
+        diff_out    = gr.Image(label="|Fixed − Warped| Heatmap",   height=300)
+
+    overlay_out = gr.Image(label="Side-by-side: Moving | Fixed | Warped", height=260)
+    ncc_out     = gr.Textbox(label="Alignment Score", interactive=False,
+                             elem_classes=["score-box"])
+
+    # ── Wire up ──────────────────────────────────────────────────────
+    register_btn.click(
+        fn=run_registration,
+        inputs=[fixed_input, moving_input],
+        outputs=[warped_out, diff_out, overlay_out, ncc_out],
+    )
+
+    # ── Example images hint ──────────────────────────────────────────
+    gr.Markdown(
+        "> **Tip:** Images are automatically converted to grayscale and resized to 128×128. "
+        "Any PNG, JPG, or JPEG chest X-ray will work."
+    )
+
+    # ── How it works accordion ───────────────────────────────────────
+    with gr.Accordion("ℹ️  How it works", open=False):
+        gr.Markdown("""
+**Pipeline:**
+1. Your images are sent to the local Flask server (`inference_server.py`)
+2. The server loads `registration_model_final.pth` — your trained GAN generator
+3. The U-Net generator predicts a dense 2-D deformation flow field
+4. The Spatial Transformer warps the Moving image using that flow
+5. Results are returned as images + an NCC alignment score
+
+**NCC Score guide:**
+| Score | Meaning |
+|-------|---------|
+| > 0.85 | Excellent alignment |
+| 0.65 – 0.85 | Good alignment |
+| 0.40 – 0.65 | Fair — model may need more training |
+| < 0.40 | Poor — check image quality or retrain |
+
+**Files involved:**
+- `registration_model_final.pth` — trained generator weights
+- `inference_server.py` — Flask backend (must be running)
+- `ui.py` — this Gradio frontend
+        """)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Launch
+# ─────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,          # set True to get a public gradio.live link
+        inbrowser=True,       # auto-opens your browser
+    )

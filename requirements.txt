@@ -1,0 +1,20 @@
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Medical imaging transforms (used in training)
+monai>=1.2.0
+
+# Inference server
+flask>=3.0.0
+
+# Frontend
+gradio>=4.0.0
+
+# Image & data
+Pillow>=10.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# HTTP client (used by ui.py)
+requests>=2.31.0
