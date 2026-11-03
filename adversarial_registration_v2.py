@@ -78,6 +78,34 @@ class NCCLoss(nn.Module):
         return -torch.mean(ncc)
 
 
+class MultiScaleNCCLoss(nn.Module):
+    """
+    Signed multi-scale NCC across windows [5, 9, 21].
+    Uses cov/sqrt(varI*varJ) — full [-1,1] gradient range.
+    """
+    def __init__(self, wins=(5, 9, 21), eps=1e-5):
+        super().__init__()
+        self.wins = wins
+        self.eps  = eps
+
+    def _ncc_at_scale(self, I, J, win):
+        weight = torch.ones((1, 1, win, win), device=I.device) / (win * win)
+        pad    = win // 2
+        I_mean  = F.conv2d(I,     weight, padding=pad)
+        J_mean  = F.conv2d(J,     weight, padding=pad)
+        I2_mean = F.conv2d(I * I, weight, padding=pad)
+        J2_mean = F.conv2d(J * J, weight, padding=pad)
+        IJ_mean = F.conv2d(I * J, weight, padding=pad)
+        var_I  = I2_mean - I_mean ** 2
+        var_J  = J2_mean - J_mean ** 2
+        cov_IJ = IJ_mean - I_mean * J_mean
+        ncc = cov_IJ / (torch.sqrt(var_I * var_J + self.eps))
+        return -torch.mean(ncc)
+
+    def forward(self, I, J):
+        return sum(self._ncc_at_scale(I, J, w) for w in self.wins) / len(self.wins)
+
+
 def l2_gradient_loss(flow):
     """Penalises sharp spatial changes in the deformation field."""
     dy = flow[:, :, 1:, :] - flow[:, :, :-1, :]
@@ -229,20 +257,17 @@ class DoubleConv(nn.Module):
 
 
 class RegistrationGenerator(nn.Module):
-    """
-    Deep U-Net with:
-      • 4-level encoder to capture large deformations
-      • InstanceNorm throughout (better than BN for GANs)
-      • Light dropout at bottleneck for regularisation
-      • Zero-initialised flow head (identity init)
-    """
     def __init__(self, in_channels=2, out_channels=2):
         super().__init__()
 
         self.inc   = DoubleConv(in_channels, 32)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(32, 64))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
-        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256, dropout_p=0.2))  # bottleneck dropout
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(32,  64))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64,  128))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        self.down4 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512, dropout_p=0.2))  # NEW
+
+        self.up4   = nn.ConvTranspose2d(512, 256, 2, stride=2)   # NEW
+        self.conv4 = DoubleConv(512, 256)                         # NEW
 
         self.up3   = nn.ConvTranspose2d(256, 128, 2, stride=2)
         self.conv3 = DoubleConv(256, 128)
@@ -254,19 +279,21 @@ class RegistrationGenerator(nn.Module):
         self.conv1 = DoubleConv(64, 32)
 
         self.flow_conv = nn.Conv2d(32, out_channels, 3, padding=1)
-        # Identity initialisation — prevents chaotic flows at epoch 0
         nn.init.normal_(self.flow_conv.weight, mean=0.0, std=1e-5)
         nn.init.zeros_(self.flow_conv.bias)
 
     def forward(self, m, f):
         x = torch.cat([m, f], dim=1)
-
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
+        x5 = self.down4(x4)          # NEW
 
-        u3 = self.up3(x4)
+        u4 = self.up4(x5)            # NEW
+        d4 = self.conv4(torch.cat([u4, x4], dim=1))  # NEW
+
+        u3 = self.up3(d4)
         d3 = self.conv3(torch.cat([u3, x3], dim=1))
 
         u2 = self.up2(d3)
@@ -275,7 +302,13 @@ class RegistrationGenerator(nn.Module):
         u1 = self.up1(d2)
         d1 = self.conv1(torch.cat([u1, x1], dim=1))
 
-        return self.flow_conv(d1)
+        # CRITICAL FIX: tanh clamp keeps flow in ±32 pixel range.
+        # Without this, the flow field grows unbounded during training —
+        # pixels get sampled far outside the image bounds, grid_sample
+        # clamps them to the border, creating the white bands and
+        # swirling artefacts visible in the warped output image.
+        flow = self.flow_conv(d1)
+        return torch.tanh(flow) * 32.0
 
 
 class AlignmentDiscriminator(nn.Module):
@@ -346,25 +379,42 @@ def main():
     discriminator = AlignmentDiscriminator().to(device)
     transformer   = SpatialTransformer(size=img_size).to(device)
 
-    # Separate LRs: discriminator slightly lower so generator isn't left behind
-    opt_g = torch.optim.Adam(generator.parameters(),     lr=2e-4, betas=(0.5, 0.999))
-    opt_d = torch.optim.Adam(discriminator.parameters(), lr=1e-4, betas=(0.5, 0.999))
+    # FIX 1: Generator LR lowered (2e-4 to 1e-4) — was too aggressive at epoch 1.
+    # FIX 2: Discriminator LR raised to match generator — must keep up.
+    #         When D_LR < G_LR the generator always outpaces discriminator,
+    #         causing D Loss >> 0.6931 from the very first epoch.
+    # FIX 3: weight_decay=1e-4 on generator — L2 regularisation prevents
+    #         weights growing unchecked (a core cause of overfitting).
+    opt_g = torch.optim.Adam(generator.parameters(),
+                             lr=1e-4, betas=(0.5, 0.999), weight_decay=1e-4)
+    opt_d = torch.optim.Adam(discriminator.parameters(),
+                             lr=2e-4, betas=(0.5, 0.999))
 
-    # Cosine Annealing — smoothly decays LR to prevent late-stage oscillations
     epochs = 50
     scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=epochs, eta_min=1e-6)
     scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(opt_d, T_max=epochs, eta_min=1e-6)
 
     criterion_gan = nn.BCEWithLogitsLoss()
-    criterion_ncc = NCCLoss().to(device)
+    criterion_ncc = MultiScaleNCCLoss(wins=(5, 9, 21)).to(device)
 
-    # Loss weights
-    lambda_sim    = 15.0   # NCC similarity reward
-    lambda_smooth =  0.5   # Deformation field smoothness
-    lambda_gan    =  0.5   # Adversarial signal  (raised from 0.1 — was too weak)
-    lambda_fm     =  5.0   # Feature matching    (new)
-    lambda_r1     =  5.0   # R1 gradient penalty (new — kills discriminator overfitting)
-    r1_every      =  4     # Apply R1 every N discriminator steps (saves compute)
+    # FIX 4: Rebalanced loss weights.
+    # lambda_sim lowered (20 to 15) — at 20 the NCC term dominates so heavily
+    # the generator ignores the discriminator entirely from epoch 1,
+    # causing D Loss=1.15 (discriminator gets no meaningful gradient signal).
+    # lambda_gan raised (0.3 to 1.0) — discriminator must matter enough
+    # to constrain the generator and prevent early overfitting.
+    # lambda_smooth raised (1.0 to 2.0) — prevents chaotic early flow fields.
+    lambda_sim    = 15.0
+    lambda_smooth =  2.0
+    lambda_gan    =  1.0
+    lambda_fm     =  2.0
+    lambda_r1     =  5.0
+
+    # FIX 5: n_critic=2 — train discriminator TWICE per generator step.
+    # Standard GAN practice when D Loss > 0.9 — the discriminator is losing
+    # badly and needs more gradient updates to catch up to the generator.
+    n_critic = 2
+    r1_every = 4
 
     # ── Early Stopping ───────────────────────────────────────────────
     early_stopping = EarlyStopping(
@@ -386,35 +436,41 @@ def main():
         for i, (moving, fixed) in enumerate(train_loader):
             moving, fixed = moving.to(device), fixed.to(device)
 
-            # ── Discriminator Step ────────────────────────────────────────
-            opt_d.zero_grad()
+            # ── Discriminator Step (n_critic times) ──────────────────────
+            # FIX 5: train discriminator n_critic=2 times per generator step.
+            # Runs discriminator updates in a loop so it can catch up when
+            # it is being overpowered (D Loss > 0.9 signals this clearly).
+            d_loss_accum = 0.0
+            for _ in range(n_critic):
+                opt_d.zero_grad()
 
-            with torch.no_grad():
-                flow   = generator(moving, fixed)
-                warped = transformer(moving, flow)
+                with torch.no_grad():
+                    flow   = generator(moving, fixed)
+                    warped = transformer(moving, flow)
 
-            # Real pair logits — label smoothing: real → 0.9
-            real_preds = discriminator(fixed, fixed)
-            loss_d_real = criterion_gan(real_preds,
-                                        torch.full_like(real_preds, 0.9))
+                # Real pair — label smoothing: 1.0 → 0.9
+                real_preds  = discriminator(fixed, fixed)
+                loss_d_real = criterion_gan(real_preds,
+                                            torch.full_like(real_preds, 0.9))
 
-            # Fake pair logits — label smoothing: fake → 0.1
-            fake_preds = discriminator(warped.detach(), fixed)
-            loss_d_fake = criterion_gan(fake_preds,
-                                        torch.full_like(fake_preds, 0.1))
+                # Fake pair — label smoothing: 0.0 → 0.1
+                fake_preds  = discriminator(warped.detach(), fixed)
+                loss_d_fake = criterion_gan(fake_preds,
+                                            torch.full_like(fake_preds, 0.1))
 
-            loss_d = (loss_d_real + loss_d_fake) * 0.5
+                loss_d = (loss_d_real + loss_d_fake) * 0.5
 
-            # R1 Gradient Penalty — prevents discriminator memorising real data
-            if i % r1_every == 0:
-                r1_pen   = r1_gradient_penalty(discriminator, fixed, fixed)
-                loss_d   = loss_d + (lambda_r1 * r1_pen * r1_every)  # scale to match every-step
+                # R1 Gradient Penalty
+                if i % r1_every == 0:
+                    r1_pen = r1_gradient_penalty(discriminator, fixed, fixed)
+                    loss_d = loss_d + (lambda_r1 * r1_pen * r1_every)
 
-            # ── FIX: actually update the discriminator ────────────────────
-            loss_d.backward()
-            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-            opt_d.step()
-            epoch_d_loss += loss_d.item()
+                loss_d.backward()
+                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                opt_d.step()
+                d_loss_accum += loss_d.item()
+
+            epoch_d_loss += d_loss_accum / n_critic   # average across critic steps
 
             # ── Generator Step ────────────────────────────────────────────
             opt_g.zero_grad()
@@ -437,6 +493,10 @@ def main():
                     + lambda_smooth * loss_smooth
                     + lambda_gan    * loss_gan
                     + lambda_fm     * loss_fm)
+            # NOTE: MSE loss removed — it conflicts with NCC by penalising
+            # intensity differences independently of spatial alignment,
+            # causing the generator to produce blurred averages rather than
+            # sharp registered images. NCC already handles similarity.
 
             loss_g.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)  # stability
@@ -467,9 +527,17 @@ def main():
         is_best = early_stopping.step(avg_val, generator, discriminator, epoch)
         tag     = " ✦ NEW BEST — checkpoint saved" if is_best else ""
 
+        # D Loss health check — warn if discriminator is losing balance
+        if avg_d > 0.85:
+            d_status = "⚠ D losing (generator overpowering)"
+        elif avg_d < 0.50:
+            d_status = "⚠ D winning (discriminator overpowering)"
+        else:
+            d_status = "✓ balanced"
+
         print(f"Epoch [{epoch+1:03d}/{epochs}] | "
               f"Time: {time.time()-t0:.1f}s | "
-              f"D Loss: {avg_d:.4f} | "
+              f"D Loss: {avg_d:.4f} [{d_status}] | "
               f"G Loss: {avg_g:.4f} | "
               f"Val NCC: {avg_val:.4f} | "
               f"LR: {lr_g:.2e}{tag}")

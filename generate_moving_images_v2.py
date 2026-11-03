@@ -216,8 +216,8 @@ def generate_one(fixed_path: str, moving_path: str, preset: dict):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate moving X-ray dataset")
-    parser.add_argument("--fixed_dir",   default=r"C:\image registration using gan\dataset\fixed")
-    parser.add_argument("--moving_dir",  default=r"C:\image registration using gan\dataset\moving")
+    parser.add_argument("--fixed_dir",   default=r"C:\image registration using gan\dataset\fixed1")
+    parser.add_argument("--moving_dir",  default=r"C:\image registration using gan\dataset\moving2")
     parser.add_argument("--difficulty",  default="medium", choices=["easy", "medium", "hard"])
     parser.add_argument("--workers",     type=int, default=4,
                         help="Parallel workers (use 1 to disable parallelism)")
